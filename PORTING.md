@@ -30,6 +30,7 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory web
 ```
 
 `hello`、`readfile`、`writefile`、`exit` は元のシェルと同じコマンドです。
+`help` で利用できるコマンドの一覧を表示します。
 `writefile` の後に `readfile` を実行すると変更を確認できます。
 ディスクの変更は実行中のメモリに保持します。再起動前に **Download disk** で
 変更後の tar を取り出せます。Restart はビルド時のイメージから起動します。

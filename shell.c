@@ -39,6 +39,8 @@ WASM_EXPORT("step") void main(void) {
 command:
     if (strcmp(cmdline, "hello") == 0)
         printf("Hello world from shell!\n");
+    else if (strcmp(cmdline, "help") == 0)
+        printf("hello  readfile  writefile  help  exit\n");
     else if (strcmp(cmdline, "exit") == 0)
         exit();
     else if (strcmp(cmdline, "readfile") == 0) {
