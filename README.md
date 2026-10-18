@@ -6,6 +6,22 @@
 
 This repository contains the source code for the website [Operating System in 1,000 Lines](https://1000os.seiya.me/), and a reference implementation.
 
+## WebAssembly port
+
+The kernel and shell in the existing root-level C and header files now target
+WebAssembly. The port keeps the original filesystem structures and function names
+so its changes can be compared with the RISC-V implementation. The browser host is
+in `web/`, and integration tests are in `tests/`.
+
+```sh
+WASI_SDK_PATH=/path/to/wasi-sdk ./run.sh
+```
+
+Open <http://localhost:8000/>. Use `./run.sh --build` to build without starting the
+server, or `./run.sh --test` to build and run the Node.js integration tests.
+See [the porting notes](PORTING.md) for the code mapping, API changes, and limitations.
+The book under `website/` describes the original RISC-V implementation.
+
 ## More interesting implementations
 
 The book only covers the basics of an operating system. You can do more with the knowledge you have gained. Here are some ideas:

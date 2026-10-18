@@ -19,7 +19,10 @@ typedef uint32_t vaddr_t;
 #define va_start __builtin_va_start
 #define va_end   __builtin_va_end
 #define va_arg   __builtin_va_arg
-#define PAGE_SIZE 4096
+#define PAGE_SIZE 65536 // WebAssembly linear-memory page size
+#define WASM_EXPORT(name) __attribute__((export_name(name)))
+#define WASM_IMPORT(module, name) \
+    __attribute__((import_module(module), import_name(name)))
 #define SYS_PUTCHAR 1
 #define SYS_GETCHAR 2
 #define SYS_EXIT    3

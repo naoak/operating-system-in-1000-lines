@@ -1,171 +1,64 @@
 #include "kernel.h"
 #include "common.h"
 
-extern char __kernel_base[];
-extern char __stack_top[];
-extern char __bss[], __bss_end[];
-extern char __free_ram[], __free_ram_end[];
-extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
+extern char __heap_base[];
+
+WASM_IMPORT("host", "putchar") void host_putchar(int pid, int ch);
+WASM_IMPORT("host", "step") void host_step(int pid);
 
 struct process procs[PROCS_MAX];
 struct process *current_proc;
 struct process *idle_proc;
+static struct process idle;
+static bool running_user;
+static struct syscall_message message;
 
-paddr_t alloc_pages(uint32_t n) {
-    static paddr_t next_paddr = (paddr_t) __free_ram;
-    paddr_t paddr = next_paddr;
-    next_paddr += n * PAGE_SIZE;
+// Pages are offsets in this module's linear memory. User process memories
+// belong to separate Wasm instances and are created by the host.
+WASM_EXPORT("alloc_pages") void *alloc_pages(uint32_t n) {
+    static uint32_t next_vaddr;
+    if (!next_vaddr)
+        next_vaddr = align_up((uint32_t) __heap_base, PAGE_SIZE);
+    if (!n || n > (0xffffffffu - next_vaddr) / PAGE_SIZE)
+        return NULL;
 
-    if (next_paddr > (paddr_t) __free_ram_end)
-        PANIC("out of memory");
+    uint32_t vaddr = next_vaddr;
+    uint32_t end = vaddr + n * PAGE_SIZE;
+    uint32_t pages = __builtin_wasm_memory_size(0);
+    if (end / PAGE_SIZE > pages &&
+        __builtin_wasm_memory_grow(0, end / PAGE_SIZE - pages) == (size_t) -1)
+        return NULL;
 
-    memset((void *) paddr, 0, n * PAGE_SIZE);
-    return paddr;
+    next_vaddr = end;
+    memset((void *) vaddr, 0, n * PAGE_SIZE);
+    return (void *) vaddr;
 }
 
-void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
-    if (!is_aligned(vaddr, PAGE_SIZE))
-        PANIC("unaligned vaddr %x", vaddr);
-
-    if (!is_aligned(paddr, PAGE_SIZE))
-        PANIC("unaligned paddr %x", paddr);
-
-    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
-    if ((table1[vpn1] & PAGE_V) == 0) {
-        uint32_t pt_paddr = alloc_pages(1);
-        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
-    }
-
-    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
-    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
-    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
-}
-
-struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
-                       long arg5, long fid, long eid) {
-    register long a0 __asm__("a0") = arg0;
-    register long a1 __asm__("a1") = arg1;
-    register long a2 __asm__("a2") = arg2;
-    register long a3 __asm__("a3") = arg3;
-    register long a4 __asm__("a4") = arg4;
-    register long a5 __asm__("a5") = arg5;
-    register long a6 __asm__("a6") = fid;
-    register long a7 __asm__("a7") = eid;
-
-    __asm__ __volatile__("ecall"
-                         : "=r"(a0), "=r"(a1)
-                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5),
-                           "r"(a6), "r"(a7)
-                         : "memory");
-    return (struct sbiret){.error = a0, .value = a1};
-}
-
-struct virtio_virtq *blk_request_vq;
-struct virtio_blk_req *blk_req;
-paddr_t blk_req_paddr;
+static uint8_t *blk_data;
 uint64_t blk_capacity;
 
-uint32_t virtio_reg_read32(unsigned offset) {
-    return *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset));
+WASM_EXPORT("disk_buffer") void *disk_buffer(void) {
+    if (!blk_data)
+        blk_data = alloc_pages(align_up(DISK_CAPACITY, PAGE_SIZE) / PAGE_SIZE);
+    return blk_data;
 }
 
-uint64_t virtio_reg_read64(unsigned offset) {
-    return *((volatile uint64_t *) (VIRTIO_BLK_PADDR + offset));
-}
-
-void virtio_reg_write32(unsigned offset, uint32_t value) {
-    *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset)) = value;
-}
-
-void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value) {
-    virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
-}
-
-bool virtq_is_busy(struct virtio_virtq *vq) {
-    return vq->last_used_index != *vq->used_index;
-}
-
-void virtq_kick(struct virtio_virtq *vq, int desc_index) {
-    vq->avail.ring[vq->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
-    vq->avail.index++;
-    __sync_synchronize();
-    virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
-    vq->last_used_index++;
-}
-
-struct virtio_virtq *virtq_init(unsigned index) {
-    paddr_t virtq_paddr = alloc_pages(align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
-    struct virtio_virtq *vq = (struct virtio_virtq *) virtq_paddr;
-    vq->queue_index = index;
-    vq->used_index = (volatile uint16_t *) &vq->used.index;
-    virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
-    virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
-    virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr / PAGE_SIZE);
-    return vq;
-}
-
-void virtio_blk_init(void) {
-    if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
-        PANIC("virtio: invalid magic value");
-    if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
-        PANIC("virtio: invalid version");
-    if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
-        PANIC("virtio: invalid device id");
-
-    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
-    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
-    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
-    virtio_reg_write32(VIRTIO_REG_PAGE_SIZE, PAGE_SIZE);
-    blk_request_vq = virtq_init(0);
-    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
-
-    blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
-    printf("virtio-blk: capacity is %d bytes\n", (int)blk_capacity);
-
-    blk_req_paddr = alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
-    blk_req = (struct virtio_blk_req *) blk_req_paddr;
+void blk_init(unsigned size) {
+    blk_capacity = size;
+    printf("disk: capacity is %d bytes\n", (int) blk_capacity);
 }
 
 void read_write_disk(void *buf, unsigned sector, int is_write) {
     if (sector >= blk_capacity / SECTOR_SIZE) {
-        printf("virtio: tried to read/write sector=%d, but capacity is %d\n",
-              sector, blk_capacity / SECTOR_SIZE);
+        printf("disk: tried to read/write sector=%d, but capacity is %d\n",
+               sector, (int) (blk_capacity / SECTOR_SIZE));
         return;
     }
-
-    blk_req->sector = sector;
-    blk_req->type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
 
     if (is_write)
-        memcpy(blk_req->data, buf, SECTOR_SIZE);
-
-    struct virtio_virtq *vq = blk_request_vq;
-    vq->descs[0].addr = blk_req_paddr;
-    vq->descs[0].len = sizeof(uint32_t) * 2 + sizeof(uint64_t);
-    vq->descs[0].flags = VIRTQ_DESC_F_NEXT;
-    vq->descs[0].next = 1;
-
-    vq->descs[1].addr = blk_req_paddr + offsetof(struct virtio_blk_req, data);
-    vq->descs[1].len = SECTOR_SIZE;
-    vq->descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? 0 : VIRTQ_DESC_F_WRITE);
-    vq->descs[1].next = 2;
-
-    vq->descs[2].addr = blk_req_paddr + offsetof(struct virtio_blk_req, status);
-    vq->descs[2].len = sizeof(uint8_t);
-    vq->descs[2].flags = VIRTQ_DESC_F_WRITE;
-
-    virtq_kick(vq, 0);
-    while (virtq_is_busy(vq))
-        ;
-
-    if (blk_req->status != 0) {
-        printf("virtio: warn: failed to read/write sector=%d status=%d\n",
-               sector, blk_req->status);
-        return;
-    }
-
-    if (!is_write)
-        memcpy(buf, blk_req->data, SECTOR_SIZE);
+        memcpy(&blk_data[sector * SECTOR_SIZE], buf, SECTOR_SIZE);
+    else
+        memcpy(buf, &blk_data[sector * SECTOR_SIZE], SECTOR_SIZE);
 }
 
 struct file files[FILES_MAX];
@@ -177,6 +70,8 @@ int oct2int(char *oct, int len) {
         if (oct[i] < '0' || oct[i] > '7')
             break;
 
+        if ((unsigned) dec > (0x7fffffffu - (oct[i] - '0')) / 8)
+            return -1;
         dec = dec * 8 + (oct[i] - '0');
     }
     return dec;
@@ -195,11 +90,11 @@ void fs_flush(void) {
         strcpy(header->name, file->name);
         strcpy(header->mode, "000644");
         strcpy(header->magic, "ustar");
-        strcpy(header->version, "00");
+        memcpy(header->version, "00", 2);
         header->type = '0';
 
         int filesz = file->size;
-        for (int i = sizeof(header->size); i > 0; i--) {
+        for (int i = sizeof(header->size) - 1; i > 0; i--) {
             header->size[i - 1] = (filesz % 8) + '0';
             filesz /= 8;
         }
@@ -213,6 +108,7 @@ void fs_flush(void) {
             checksum /= 8;
         }
 
+        header->checksum[7] = ' ';
         memcpy(header->data, file->data, file->size);
         off += align_up(sizeof(struct tar_header) + file->size, SECTOR_SIZE);
     }
@@ -223,7 +119,7 @@ void fs_flush(void) {
     printf("wrote %d bytes to disk\n", sizeof(disk));
 }
 
-void fs_init(void) {
+int fs_init(void) {
     for (unsigned sector = 0; sector < sizeof(disk) / SECTOR_SIZE; sector++)
         read_write_disk(&disk[sector * SECTOR_SIZE], sector, false);
 
@@ -231,13 +127,19 @@ void fs_init(void) {
     for (int i = 0; i < FILES_MAX; i++) {
         struct tar_header *header = (struct tar_header *) &disk[off];
         if (header->name[0] == '\0')
-            break;
+            return 0;
 
-        if (strcmp(header->magic, "ustar") != 0)
-            PANIC("invalid tar header: magic=\"%s\"", header->magic);
+        if (header->name[sizeof(header->name) - 1] ||
+            header->prefix[0] ||
+            (header->type != '0' && header->type != '\0') ||
+            strcmp(header->magic, "ustar") != 0)
+            return -1;
 
         int filesz = oct2int(header->size, sizeof(header->size));
         struct file *file = &files[i];
+        if (filesz < 0 || filesz > (int) sizeof(file->data) ||
+            off + align_up(sizeof(*header) + filesz, SECTOR_SIZE) > sizeof(disk))
+            return -1;
         file->in_use = true;
         strcpy(file->name, header->name);
         memcpy(file->data, header->data, filesz);
@@ -246,12 +148,14 @@ void fs_init(void) {
 
         off += align_up(sizeof(struct tar_header) + filesz, SECTOR_SIZE);
     }
+    struct tar_header *end = (struct tar_header *) &disk[off];
+    return off + sizeof(*end) <= sizeof(disk) && !end->name[0] ? 0 : -1;
 }
 
 struct file *fs_lookup(const char *filename) {
     for (int i = 0; i < FILES_MAX; i++) {
         struct file *file = &files[i];
-        if (!strcmp(file->name, filename))
+        if (file->in_use && !strcmp(file->name, filename))
             return file;
     }
 
@@ -259,144 +163,19 @@ struct file *fs_lookup(const char *filename) {
 }
 
 void putchar(char ch) {
-    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+    host_putchar(current_proc ? current_proc->pid : 0, (uint8_t) ch);
 }
 
 long getchar(void) {
-    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
-    return ret.error;
+    if (!current_proc->input_count)
+        return -1;
+    int ch = current_proc->input[current_proc->input_head];
+    current_proc->input_head = (current_proc->input_head + 1) % INPUT_CAPACITY;
+    current_proc->input_count--;
+    return ch;
 }
 
-__attribute__((naked))
-__attribute__((aligned(4)))
-void kernel_entry(void) {
-    __asm__ __volatile__(
-        "csrrw sp, sscratch, sp\n"
-        "addi sp, sp, -4 * 31\n"
-        "sw ra,  4 * 0(sp)\n"
-        "sw gp,  4 * 1(sp)\n"
-        "sw tp,  4 * 2(sp)\n"
-        "sw t0,  4 * 3(sp)\n"
-        "sw t1,  4 * 4(sp)\n"
-        "sw t2,  4 * 5(sp)\n"
-        "sw t3,  4 * 6(sp)\n"
-        "sw t4,  4 * 7(sp)\n"
-        "sw t5,  4 * 8(sp)\n"
-        "sw t6,  4 * 9(sp)\n"
-        "sw a0,  4 * 10(sp)\n"
-        "sw a1,  4 * 11(sp)\n"
-        "sw a2,  4 * 12(sp)\n"
-        "sw a3,  4 * 13(sp)\n"
-        "sw a4,  4 * 14(sp)\n"
-        "sw a5,  4 * 15(sp)\n"
-        "sw a6,  4 * 16(sp)\n"
-        "sw a7,  4 * 17(sp)\n"
-        "sw s0,  4 * 18(sp)\n"
-        "sw s1,  4 * 19(sp)\n"
-        "sw s2,  4 * 20(sp)\n"
-        "sw s3,  4 * 21(sp)\n"
-        "sw s4,  4 * 22(sp)\n"
-        "sw s5,  4 * 23(sp)\n"
-        "sw s6,  4 * 24(sp)\n"
-        "sw s7,  4 * 25(sp)\n"
-        "sw s8,  4 * 26(sp)\n"
-        "sw s9,  4 * 27(sp)\n"
-        "sw s10, 4 * 28(sp)\n"
-        "sw s11, 4 * 29(sp)\n"
-
-        "csrr a0, sscratch\n"
-        "sw a0,  4 * 30(sp)\n"
-
-        "addi a0, sp, 4 * 31\n"
-        "csrw sscratch, a0\n"
-
-        "mv a0, sp\n"
-        "call handle_trap\n"
-
-        "lw ra,  4 * 0(sp)\n"
-        "lw gp,  4 * 1(sp)\n"
-        "lw tp,  4 * 2(sp)\n"
-        "lw t0,  4 * 3(sp)\n"
-        "lw t1,  4 * 4(sp)\n"
-        "lw t2,  4 * 5(sp)\n"
-        "lw t3,  4 * 6(sp)\n"
-        "lw t4,  4 * 7(sp)\n"
-        "lw t5,  4 * 8(sp)\n"
-        "lw t6,  4 * 9(sp)\n"
-        "lw a0,  4 * 10(sp)\n"
-        "lw a1,  4 * 11(sp)\n"
-        "lw a2,  4 * 12(sp)\n"
-        "lw a3,  4 * 13(sp)\n"
-        "lw a4,  4 * 14(sp)\n"
-        "lw a5,  4 * 15(sp)\n"
-        "lw a6,  4 * 16(sp)\n"
-        "lw a7,  4 * 17(sp)\n"
-        "lw s0,  4 * 18(sp)\n"
-        "lw s1,  4 * 19(sp)\n"
-        "lw s2,  4 * 20(sp)\n"
-        "lw s3,  4 * 21(sp)\n"
-        "lw s4,  4 * 22(sp)\n"
-        "lw s5,  4 * 23(sp)\n"
-        "lw s6,  4 * 24(sp)\n"
-        "lw s7,  4 * 25(sp)\n"
-        "lw s8,  4 * 26(sp)\n"
-        "lw s9,  4 * 27(sp)\n"
-        "lw s10, 4 * 28(sp)\n"
-        "lw s11, 4 * 29(sp)\n"
-        "lw sp,  4 * 30(sp)\n"
-        "sret\n"
-    );
-}
-
-__attribute__((naked)) void user_entry(void) {
-    __asm__ __volatile__(
-        "csrw sepc, %[sepc]\n"
-        "csrw sstatus, %[sstatus]\n"
-        "sret\n"
-        :
-        : [sepc] "r" (USER_BASE),
-          [sstatus] "r" (SSTATUS_SPIE | SSTATUS_SUM)
-    );
-}
-
-__attribute__((naked)) void switch_context(uint32_t *prev_sp,
-                                           uint32_t *next_sp) {
-    __asm__ __volatile__(
-        "addi sp, sp, -13 * 4\n"
-        "sw ra,  0  * 4(sp)\n"
-        "sw s0,  1  * 4(sp)\n"
-        "sw s1,  2  * 4(sp)\n"
-        "sw s2,  3  * 4(sp)\n"
-        "sw s3,  4  * 4(sp)\n"
-        "sw s4,  5  * 4(sp)\n"
-        "sw s5,  6  * 4(sp)\n"
-        "sw s6,  7  * 4(sp)\n"
-        "sw s7,  8  * 4(sp)\n"
-        "sw s8,  9  * 4(sp)\n"
-        "sw s9,  10 * 4(sp)\n"
-        "sw s10, 11 * 4(sp)\n"
-        "sw s11, 12 * 4(sp)\n"
-        "sw sp, (a0)\n"
-        "lw sp, (a1)\n"
-        "lw ra,  0  * 4(sp)\n"
-        "lw s0,  1  * 4(sp)\n"
-        "lw s1,  2  * 4(sp)\n"
-        "lw s2,  3  * 4(sp)\n"
-        "lw s3,  4  * 4(sp)\n"
-        "lw s4,  5  * 4(sp)\n"
-        "lw s5,  6  * 4(sp)\n"
-        "lw s6,  7  * 4(sp)\n"
-        "lw s7,  8  * 4(sp)\n"
-        "lw s8,  9  * 4(sp)\n"
-        "lw s9,  10 * 4(sp)\n"
-        "lw s10, 11 * 4(sp)\n"
-        "lw s11, 12 * 4(sp)\n"
-        "addi sp, sp, 13 * 4\n"
-        "ret\n"
-    );
-}
-
-struct process *create_process(const void *image, size_t image_size) {
+struct process *create_process(void) {
     struct process *proc = NULL;
     int i;
     for (i = 0; i < PROCS_MAX; i++) {
@@ -407,47 +186,12 @@ struct process *create_process(const void *image, size_t image_size) {
     }
 
     if (!proc)
-        PANIC("no free process slots");
+        return NULL;
 
-    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) user_entry;  // ra
-
-    uint32_t *page_table = (uint32_t *) alloc_pages(1);
-
-    // Kernel pages.
-    for (paddr_t paddr = (paddr_t) __kernel_base;
-         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
-        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
-
-    // virtio-blk
-    map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
-
-    // User pages.
-    for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
-        paddr_t page = alloc_pages(1);
-        size_t remaining = image_size - off;
-        size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
-        memcpy((void *) page, image + off, copy_size);
-        map_page(page_table, USER_BASE + off, page,
-                 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
-    }
-
+    // The host instantiates the program with its own memory; there is no
+    // kernel stack, page table, or executable image to copy into this memory.
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
-    proc->sp = (uint32_t) sp;
-    proc->page_table = page_table;
     return proc;
 }
 
@@ -461,62 +205,59 @@ void yield(void) {
         }
     }
 
-    if (next == current_proc)
-        return;
-
-    struct process *prev = current_proc;
     current_proc = next;
-
-    __asm__ __volatile__(
-        "sfence.vma\n"
-        "csrw satp, %[satp]\n"
-        "sfence.vma\n"
-        "csrw sscratch, %[sscratch]\n"
-        :
-        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
-          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
-    );
-
-    switch_context(&prev->sp, &next->sp);
+    if (next != idle_proc) {
+        // Each call is one bounded quantum. The user program saves its state
+        // before returning, so no CPU register or call-stack switching occurs.
+        running_user = true;
+        host_step(next->pid);
+        running_user = false;
+    }
 }
 
-void handle_syscall(struct trap_frame *f) {
-    switch (f->a3) {
-        case SYS_PUTCHAR:
-            putchar(f->a0);
-            break;
-        case SYS_GETCHAR:
-            while (1) {
-                long ch = getchar();
-                if (ch >= 0) {
-                    f->a0 = ch;
-                    break;
-                }
+WASM_EXPORT("handle_syscall")
+int handle_syscall(int pid, int sysno, int arg0, int arg1, int arg2) {
+    if (!running_user || current_proc->pid != pid ||
+        current_proc->state != PROC_RUNNABLE)
+        return -1;
 
-                yield();
-            }
-            break;
+    switch (sysno) {
+        case SYS_PUTCHAR:
+            putchar(arg0);
+            return 0;
+        case SYS_GETCHAR: {
+            long ch = getchar();
+            if (ch < 0)
+                current_proc->state = PROC_WAITING;
+            return ch;
+        }
         case SYS_EXIT:
             printf("process %d exited\n", current_proc->pid);
             current_proc->state = PROC_EXITED;
-            yield();
-            PANIC("unreachable");
+            current_proc->exit_code = arg0;
+            // The host unwinds this user's invocation after dispatch returns.
+            return 0;
         case SYS_READFILE:
         case SYS_WRITEFILE: {
-            const char *filename = (const char *) f->a0;
-            char *buf = (char *) f->a1;
-            int len = f->a2;
+            // Only the host may pass kernel pointers, into the dedicated
+            // message buffer after validating and copying the user arguments.
+            if (arg0 != (int) message.filename || arg1 != (int) message.buf ||
+                arg2 < 0 || arg2 > (int) sizeof(message.buf) ||
+                message.filename[sizeof(message.filename) - 1])
+                return -1;
+            const char *filename = (const char *) arg0;
+            char *buf = (char *) arg1;
+            int len = arg2;
             struct file *file = fs_lookup(filename);
             if (!file) {
                 printf("file not found: %s\n", filename);
-                f->a0 = -1;
-                break;
+                return -1;
             }
 
-            if (len > (int) sizeof(file->data))
+            if (sysno == SYS_READFILE && len > (int) file->size)
                 len = file->size;
 
-            if (f->a3 == SYS_WRITEFILE) {
+            if (sysno == SYS_WRITEFILE) {
                 memcpy(file->data, buf, len);
                 file->size = len;
                 fs_flush();
@@ -524,52 +265,90 @@ void handle_syscall(struct trap_frame *f) {
                 memcpy(buf, file->data, len);
             }
 
-            f->a0 = len;
-            break;
+            return len;
         }
         default:
-            PANIC("unexpected syscall a3=%x\n", f->a3);
+            return -1;
     }
 }
 
-void handle_trap(struct trap_frame *f) {
-    uint32_t scause = READ_CSR(scause);
-    uint32_t stval = READ_CSR(stval);
-    uint32_t user_pc = READ_CSR(sepc);
-    if (scause == SCAUSE_ECALL) {
-        handle_syscall(f);
-        user_pc += 4;
-    } else {
-        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
-    }
+WASM_EXPORT("kernel_main") int kernel_main(unsigned disk_size) {
+    if (!blk_data || disk_size < DISK_MAX_SIZE ||
+        disk_size > DISK_CAPACITY || disk_size % SECTOR_SIZE)
+        return -1;
 
-    WRITE_CSR(sepc, user_pc);
-}
+    // Wasm initializes .bss on instantiation; the uploaded disk must survive.
+    memset(procs, 0, sizeof(procs));
+    memset(files, 0, sizeof(files));
+    current_proc = NULL;
+    printf("\n\n1000 Lines OS / WebAssembly\n");
+    blk_init(disk_size);
+    if (fs_init() < 0)
+        return -1;
 
-void kernel_main(void) {
-    memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
-    printf("\n\n");
-    WRITE_CSR(stvec, (uint32_t) kernel_entry);
-    virtio_blk_init();
-    fs_init();
-
-    idle_proc = create_process(NULL, 0);
+    idle_proc = &idle;
     idle_proc->pid = 0; // idle
     current_proc = idle_proc;
 
-    create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
-    yield();
-
-    PANIC("switched to idle process");
+    // The host loads the shell module, calls spawn(), then runs the scheduler.
+    return 0;
 }
 
-__attribute__((section(".text.boot")))
-__attribute__((naked))
-void boot(void) {
-    __asm__ __volatile__(
-        "mv sp, %[stack_top]\n"
-        "j kernel_main\n"
-        :
-        : [stack_top] "r" (__stack_top)
-    );
+// Host entry points. User modules only receive os.syscall, never these exports.
+WASM_EXPORT("spawn") int spawn(void) {
+    struct process *proc = create_process();
+    return proc ? proc->pid : -1;
+}
+
+static struct process *lookup_process(int pid) {
+    if (pid < 1 || pid > PROCS_MAX || procs[pid - 1].state == PROC_UNUSED)
+        return NULL;
+    return &procs[pid - 1];
+}
+
+WASM_EXPORT("process_state") int process_state(int pid) {
+    struct process *proc = lookup_process(pid);
+    return proc ? proc->state : PROC_UNUSED;
+}
+
+WASM_EXPORT("process_exit_code") int process_exit_code(int pid) {
+    struct process *proc = lookup_process(pid);
+    return proc ? proc->exit_code : -1;
+}
+
+WASM_EXPORT("kill_process") void kill_process(int pid, int code) {
+    struct process *proc = lookup_process(pid);
+    if (proc) {
+        proc->state = PROC_EXITED;
+        proc->exit_code = code;
+    }
+}
+
+WASM_EXPORT("input_space") unsigned input_space(int pid) {
+    struct process *proc = lookup_process(pid);
+    return proc && proc->state != PROC_EXITED ? INPUT_CAPACITY - proc->input_count : 0;
+}
+
+WASM_EXPORT("input") int input(int pid, int ch) {
+    struct process *proc = lookup_process(pid);
+    if (!proc || !input_space(pid))
+        return -1;
+    proc->input[(proc->input_head + proc->input_count++) % INPUT_CAPACITY] = ch;
+    proc->state = PROC_RUNNABLE;
+    return 0;
+}
+
+WASM_EXPORT("run") unsigned run(unsigned budget) {
+    unsigned steps = 0;
+    while (steps < budget) {
+        yield();
+        if (current_proc == idle_proc)
+            break;
+        steps++;
+    }
+    return steps;
+}
+
+WASM_EXPORT("message_buffer") void *message_buffer(void) {
+    return &message;
 }
