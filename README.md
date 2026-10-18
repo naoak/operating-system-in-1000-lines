@@ -6,6 +6,19 @@
 
 This repository contains the source code for the website [Operating System in 1,000 Lines](https://1000os.seiya.me/), and a reference implementation.
 
+## WebAssembly port
+
+The [WebAssembly port](wasm/README.md) compiles the C kernel and shell into separate
+Wasm modules with isolated memories, cooperative scheduling, and the original
+tar-based filesystem. It includes a browser console and Node.js integration tests.
+
+```sh
+WASI_SDK_PATH=/path/to/wasi-sdk ./wasm/build.sh
+python3 -m http.server 8000 --bind 127.0.0.1 --directory wasm
+```
+
+Open <http://localhost:8000/>. See the port's README for toolchain options and limitations.
+
 ## More interesting implementations
 
 The book only covers the basics of an operating system. You can do more with the knowledge you have gained. Here are some ideas:

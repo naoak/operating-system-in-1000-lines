@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1000 Lines OS · WebAssembly</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<main>
+  <header>
+    <h1>1000 Lines OS <span>WebAssembly</span></h1>
+    <div class="actions">
+      <button id="save" disabled>Download disk</button>
+      <button id="restart">Restart</button>
+    </div>
+  </header>
+  <p>Try <code>hello</code>, <code>readfile</code>, <code>writefile</code>, <code>help</code>, or <code>exit</code>.</p>
+  <pre id="terminal" role="log" aria-label="OS console" aria-live="polite" tabindex="0"></pre>
+  <form id="command-form">
+    <label for="command">Command</label>
+    <input id="command" name="command" maxlength="127" autocomplete="off" autocapitalize="off" spellcheck="false" disabled>
+    <button id="send" disabled>Run</button>
+  </form>
+  <p id="status" role="status">Booting…</p>
+  <p class="note">Disk writes last until restart. Download the disk to keep a copy.</p>
+</main>
+<script type="module" src="app.mjs"></script>
+</html>

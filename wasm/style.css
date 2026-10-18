@@ -1,0 +1,23 @@
+:root { color-scheme: dark; font: 16px/1.6 system-ui, sans-serif; }
+body { margin: 0; background: #171a1d; color: #e6e8e8; }
+main { max-width: 900px; margin: 3rem auto; padding: 0 1.25rem; }
+header, .actions, form { display: flex; align-items: center; gap: .75rem; }
+header { justify-content: space-between; flex-wrap: wrap; }
+h1 { margin: 0; font-size: 1.4rem; font-weight: 600; }
+h1 span { display: inline-block; margin-left: .5rem; color: #a5b8a7; font-size: .9rem; font-weight: 400; }
+p { color: #b7bdbf; }
+code, pre, input { font-family: ui-monospace, "Cascadia Code", monospace; }
+pre { height: 24rem; padding: 1.25rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #090c0d; border: 1px solid #3b4346; }
+button, input { font-size: 1rem; border: 1px solid #596366; border-radius: 3px; padding: .45rem .7rem; }
+button { color: inherit; background: #293235; cursor: pointer; }
+button:hover:enabled { background: #3b484c; }
+button:disabled { opacity: .45; cursor: default; }
+input { flex: 1; min-width: 0; color: inherit; background: #090c0d; }
+:focus-visible { outline: 2px solid #a5d1af; outline-offset: 3px; }
+.note { font-size: .85rem; }
+@media (max-width: 520px) {
+  main { margin-top: 1.5rem; }
+  pre { height: 20rem; }
+  form { flex-wrap: wrap; }
+  form label { flex-basis: 100%; }
+}
