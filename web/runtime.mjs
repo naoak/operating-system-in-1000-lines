@@ -1,7 +1,8 @@
 // The host supplies loading, memory copies and device I/O. Process states,
 // scheduling, file contents and syscall policy belong to kernel.wasm.
-export const State = Object.freeze({ UNUSED: 0, RUNNABLE: 1, WAITING: 2, EXITED: 3 });
-const SYS_READFILE = 4, SYS_WRITEFILE = 5;
+export const State = Object.freeze({ UNUSED: 0, RUNNABLE: 1, EXITED: 2, WAITING: 3 });
+const SYS_EXIT = 3, SYS_READFILE = 4, SYS_WRITEFILE = 5;
+const PROCESS_EXIT = Symbol("process exited");
 const NAME_CAPACITY = 100, FILE_CAPACITY = 1024, DISK_CAPACITY = 32 * 1024;
 const EFAULT = -14;
 
@@ -37,14 +38,16 @@ export class WasmOS {
     const image = bytes(disk);
     if (image.length > DISK_CAPACITY) throw new Error("Disk image exceeds 32 KiB");
     os.diskSize = image.length;
-    range(os.kernel.memory, os.kernel.disk_buffer(), image.length).set(image);
-    if (os.kernel.init(image.length) !== 0) throw new Error("Invalid ustar disk image");
+    const address = os.kernel.disk_buffer();
+    if (!address) throw new Error("Cannot allocate the disk buffer");
+    range(os.kernel.memory, address, image.length).set(image);
+    if (os.kernel.kernel_main(image.length) !== 0) throw new Error("Invalid ustar disk image");
     return os;
   }
 
   async spawn(program) {
     const module = await compile(program);
-    const pid = this.kernel.create_process();
+    const pid = this.kernel.spawn();
     if (pid < 0) throw new Error("No free process slots");
     const entry = { instance: null };
     this.processes.set(pid, entry);
@@ -68,6 +71,7 @@ export class WasmOS {
     try {
       this.processes.get(pid).instance.exports.step();
     } catch (error) {
+      if (error === PROCESS_EXIT) return;
       if (!(error instanceof WebAssembly.RuntimeError)) throw error;
       this.kernel.kill_process(pid, -1);
       this.faults.push({ pid, message: error.message });
@@ -78,7 +82,10 @@ export class WasmOS {
     const instance = this.processes.get(pid)?.instance;
     if (!instance) return -1;
     if (number !== SYS_READFILE && number !== SYS_WRITEFILE) {
-      return this.kernel.syscall(pid, number, arg0, 0);
+      const result = this.kernel.handle_syscall(pid, number, arg0, arg1, arg2);
+      // Preserve exit()'s noreturn contract without a busy loop or a user trap.
+      if (number === SYS_EXIT && result === 0) throw PROCESS_EXIT;
+      return result;
     }
     if (arg2 < 0 || arg2 > FILE_CAPACITY) return -1;
 
@@ -98,7 +105,7 @@ export class WasmOS {
     message.fill(0, 0, NAME_CAPACITY);
     message.set(name.subarray(0, end), 0);
     if (number === SYS_WRITEFILE) message.set(data, NAME_CAPACITY);
-    const result = this.kernel.syscall(pid, number, 0, arg2);
+    const result = this.kernel.handle_syscall(pid, number, address, address + NAME_CAPACITY, arg2);
     if (number === SYS_READFILE && result > 0) {
       data.set(range(this.kernel.memory, address + NAME_CAPACITY, result));
     }

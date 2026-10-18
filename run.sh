@@ -1,25 +1,43 @@
 #!/bin/bash
-set -xue
+set -euo pipefail
+cd "$(dirname "$0")"
 
-QEMU=qemu-system-riscv32
-CC=/opt/homebrew/opt/llvm/bin/clang
-OBJCOPY=/opt/homebrew/opt/llvm/bin/llvm-objcopy
+mode="${1:---serve}"
+case "$mode" in
+    --build|--test|--serve) ;;
+    *) echo "Usage: $0 [--build|--test|--serve]" >&2; exit 2 ;;
+esac
 
-CFLAGS="-std=c11 -O2 -g3 -Wall -Wextra --target=riscv32-unknown-elf -fuse-ld=lld -fno-stack-protector -ffreestanding -nostdlib"
+if [[ -n "${WASM_CC:-}" ]]; then
+    CC="$WASM_CC"
+elif [[ -n "${WASI_SDK_PATH:-}" ]]; then
+    CC="$WASI_SDK_PATH/bin/clang"
+else
+    CC=clang
+fi
+if ! command -v "$CC" >/dev/null; then
+    echo "Set WASM_CC to a clang with the WebAssembly backend, or set WASI_SDK_PATH." >&2
+    exit 1
+fi
+
+CFLAGS=(-std=c11 -O2 -g3 -Wall -Wextra -Werror --target=wasm32-unknown-unknown
+    -fno-stack-protector -fno-builtin -ffreestanding -nostdlib
+    -Wl,--no-entry -Wl,--export-memory -Wl,-z,stack-size=65536
+    -Wl,--initial-memory=262144 -Wl,--max-memory=16777216)
+mkdir -p web/build
 
 # Build the shell.
-$CC $CFLAGS -Wl,-Tuser.ld -Wl,-Map=shell.map -o shell.elf shell.c user.c common.c
-$OBJCOPY --set-section-flags .bss=alloc,contents -O binary shell.elf shell.bin
-$OBJCOPY -Ibinary -Oelf32-littleriscv shell.bin shell.bin.o
+"$CC" "${CFLAGS[@]}" -o web/build/shell.wasm shell.c user.c common.c
 
 # Build the kernel.
-$CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
-    kernel.c common.c shell.bin.o
+"$CC" "${CFLAGS[@]}" -o web/build/kernel.wasm kernel.c common.c
 
-(cd disk && tar cf ../disk.tar --format=ustar *.txt)
+(cd disk && tar cf ../web/build/disk.tar --format=ustar *.txt)
+echo "Built web/build/kernel.wasm, shell.wasm and disk.tar"
 
-$QEMU -machine virt -bios default -nographic -serial mon:stdio --no-reboot \
-    -d unimp,guest_errors,int,cpu_reset -D qemu.log \
-    -drive id=drive0,file=disk.tar,format=raw,if=none \
-    -device virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0 \
-    -kernel kernel.elf
+if [[ "$mode" == --test ]]; then
+    "$CC" "${CFLAGS[@]}" -o web/build/guest.wasm tests/guest.c
+    node --test tests/runtime.test.mjs
+elif [[ "$mode" == --serve ]]; then
+    exec python3 -m http.server "${WASM_PORT:-8000}" --bind 127.0.0.1 --directory web
+fi

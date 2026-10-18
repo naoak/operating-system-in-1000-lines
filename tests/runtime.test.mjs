@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { WasmOS, State } from "../runtime.mjs";
+import { WasmOS, State } from "../web/runtime.mjs";
 
-const load = (name) => readFile(new URL(`../build/${name}`, import.meta.url));
+const load = (name) => readFile(new URL(`../web/build/${name}`, import.meta.url));
 const [kernel, shell, guest, disk] = await Promise.all([
   load("kernel.wasm").then(WebAssembly.compile),
   load("shell.wasm").then(WebAssembly.compile),
@@ -114,6 +114,41 @@ test("a user trap terminates that process while other processes keep running", a
   assert.equal(os.faults[0].pid, bad);
 });
 
+test("exit unwinds the user call without running its following instructions or trapping", async () => {
+  const { os } = await boot();
+  const pid = await os.spawn(guest), other = await os.spawn(guest);
+  const user = exportsFor(os, pid);
+  user.configure(3, 7, 0, 0);
+  os.run(2);
+  assert.equal(os.kernel.process_state(pid), State.EXITED);
+  assert.equal(os.kernel.process_exit_code(pid), 7);
+  assert.equal(user.result(), 0x1234); // The assignment after syscall never ran.
+  assert.equal(exportsFor(os, other).steps(), 1);
+  assert.deepEqual(os.faults, []);
+});
+
+test("a syscall outside a scheduled invocation cannot change the filesystem", async () => {
+  const { os } = await boot();
+  const pid = await os.spawn(guest);
+  const user = exportsFor(os, pid);
+  const pointer = user.buffer();
+  const memory = new Uint8Array(user.memory.buffer);
+  memory.set(new TextEncoder().encode("hello.txt\0"), pointer);
+  memory.fill(90, pointer + 100, pointer + 108);
+  user.configure(5, pointer, pointer + 100, 8);
+  const before = os.snapshot();
+  user.step();
+  assert.equal(user.result(), -1);
+  assert.deepEqual(os.snapshot(), before);
+  os.run(1);
+  assert.equal(user.result(), 8);
+  assert.equal(tarFile(os.snapshot(), "hello.txt").toString(), "ZZZZZZZZ");
+  memory.fill(89, pointer + 100, pointer + 108);
+  user.step();
+  assert.equal(user.result(), -1);
+  assert.equal(tarFile(os.snapshot(), "hello.txt").toString(), "ZZZZZZZZ");
+});
+
 test("syscalls reject invalid user pointers, lengths, filenames and unknown calls", async () => {
   const { os } = await boot();
   const pid = await os.spawn(guest);
@@ -146,6 +181,13 @@ test("syscalls reject invalid user pointers, lengths, filenames and unknown call
   assert.equal(tarFile(os.snapshot(), "hello.txt").length, 1024);
   assert.deepEqual(tarFile(os.snapshot(), "hello.txt"), Buffer.alloc(1024, 90));
   assert.equal(tarFile(os.snapshot(), "meow.txt").toString(), "meow!\n");
+  // Both maximum-sized files plus their headers and archive end blocks fit.
+  memory.set(new TextEncoder().encode("meow.txt\0"), pointer);
+  memory.fill(89, pointer + 100, pointer + 100 + 1024);
+  assert.equal(invoke(5, pointer, pointer + 100, 1024), 1024);
+  assert.deepEqual(tarFile(os.snapshot(), "hello.txt"), Buffer.alloc(1024, 90));
+  assert.deepEqual(tarFile(os.snapshot(), "meow.txt"), Buffer.alloc(1024, 89));
+  await boot(os.snapshot());
 });
 
 test("kernel page allocation grows linear memory and preserves files and syscall copies", async () => {
@@ -169,7 +211,7 @@ test("kernel page allocation grows linear memory and preserves files and syscall
 test("overlong command lines are discarded and the next command still executes", async () => {
   const { os, output } = await boot();
   const pid = await os.spawn(shell);
-  os.input(pid, `${"x".repeat(130)}\nhellp\bo\n`);
+  os.input(pid, `${"x".repeat(130)}\nhello\n`);
   drain(os);
   assert.match(output(), /command line too long/);
   assert.match(output(), /Hello world from shell!/);
